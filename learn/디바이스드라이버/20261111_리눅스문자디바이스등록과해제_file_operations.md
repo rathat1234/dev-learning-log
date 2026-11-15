@@ -1,20 +1,21 @@
 # 리눅스 문자 디바이스의 등록·해제와 `struct file_operations`
 
-문자 디바이스를 `register_chrdev()`로 등록하면 커널은 장치 번호 범위에 파일 연산을 연결한다. 사용자 프로그램이 장치 파일을 열 때 VFS가 이 연결을 찾아 드라이버의 콜백을 설정한다. 주 번호와 부 번호의 역할, 각 시스템 호출에서 콜백으로 전달되는 인자와 결과, `unregister_chrdev()`로 연결을 해제하는 과정을 리눅스 v6.12 기준으로 정리한다.
+가상의 문자 장치가 여러 입력 채널을 제공한다고 가정한다. 리눅스 v6.12에서 채널에 장치 번호를 배정하고, 노드를 열 때 VFS가 어떤 콜백을 찾으며, 등록을 해제할 때 열린 파일에 어떤 영향이 있는지 살펴본다.
 
 학습일 **2026-11-11**
 
-## 1. 사용자 프로그램에서 장치에 접근하는 경로
+## 1. `register_chrdev()`와 `unregister_chrdev()`
 
-사용자 공간의 프로세스는 시스템 호출을 통해 커널에 장치 작업을 요청한다. 일반 파일의 내용은 파일 시스템이 관리한다. 문자 디바이스 파일은 장치 유형과 장치 번호를 담은 특수 파일이다. VFS는 이 정보를 이용해 커널에 등록된 드라이버를 찾고, 드라이버는 요청에 따라 하드웨어를 제어하거나 내부 버퍼를 처리한다. 드라이버는 커널에 내장하거나 실행 중 적재하는 모듈로 구성할 수 있다. [리눅스 VFS](https://docs.kernel.org/filesystems/vfs.html), [드라이버 초기화와 종료](https://docs.kernel.org/driver-api/basics.html#driver-entry-and-exit-points)
+두 함수는 `<linux/fs.h>`에 선언된다. v6.12의 `register_chrdev()`는 주 번호 하나의 기본 부 번호 범위를 예약하고, 내부에서 `cdev`를 생성해 `fops`와 장치 번호 범위를 연결한다. 번호를 예약할 때는 주 번호에서 계산한 해시 버킷을 찾아 같은 주 번호에서 부 번호 범위가 겹치는지 확인한다. `name`은 `/proc/devices`와 커널 진단 메시지에서 등록 항목을 식별하는 데 쓰인다. `/dev`에 표시할 노드 이름과 노드의 생성·삭제는 별도로 관리한다. 사용자 프로그램이 열 노드에는 등록 범위에 맞는 문자 장치 유형과 번호가 들어 있어야 한다. [등록 함수 선언](https://github.com/torvalds/linux/blob/v6.12/include/linux/fs.h#L2634-L2652), [문자 장치 등록 구현](https://github.com/torvalds/linux/blob/v6.12/fs/char_dev.c), [장치 번호와 노드 이름](https://docs.kernel.org/admin-guide/devices.html)
 
-| 유형 | 처리 단위와 일반적인 접근 경로 |
+| API와 조건 | 동작과 반환값 |
 | --- | --- |
-| 문자 | 장치가 정의한 바이트 스트림이나 레코드를 다룬다. 사용자 프로그램은 장치 파일을 열어 `read()`, `write()`, `ioctl()` 등을 호출한다. |
-| 블록 | 저장장치의 데이터를 블록 단위로 처리한다. 파일 시스템은 블록 계층을 통해 입출력을 요청한다. 권한이 있으면 사용자 프로그램도 블록 장치 파일을 열 수 있다. |
-| 네트워크 | 패킷을 송수신한다. 사용자 프로그램은 주로 소켓을 사용하고, 커널의 네트워크 스택이 장치 드라이버와 통신한다. |
+| `register_chrdev(0, name, fops)` | 비어 있는 주 번호를 동적으로 할당한다. 성공하면 양수인 실제 주 번호를 반환하므로 노드 생성과 해제에 사용할 값을 보관한다. |
+| `register_chrdev(major, name, fops)` (`major > 0`) | 지정한 주 번호의 범위를 예약한다. 성공하면 `0`을 반환하므로 지정한 번호를 계속 사용한다. |
+| 등록 실패 | 장치 번호 범위가 충돌하거나 동적 할당에 쓸 주 번호가 없으면 `-EBUSY`, 유효 범위를 벗어나면 `-EINVAL`, 관리 객체 할당에 실패하면 `-ENOMEM`이 발생할 수 있다. |
+| `unregister_chrdev(major, name)` | 등록할 때 사용한 이름과 실제 주 번호를 전달한다. 반환형은 `void`다. v6.12 구현은 주 번호와 부 번호 범위로 항목을 찾아 예약을 해제하고 대응하는 `cdev`를 제거한다. |
 
-문자 장치의 읽기·쓰기 단위와 종료 조건은 장치의 인터페이스에 따라 정해진다. 예를 들어 센서 이벤트는 계속 들어올 수 있으므로, 이벤트 큐가 비었을 때 블로킹 읽기는 다음 이벤트를 기다리고 비블로킹 읽기는 `EAGAIN`을 반환하도록 구현할 수 있다. 스트림 장치에서는 임의 위치로 이동하는 연산도 생략할 수 있다. [블록 계층](https://docs.kernel.org/block/blk-mq.html), [네트워크 장치](https://docs.kernel.org/networking/netdevices.html), [커널의 대기 큐](https://docs.kernel.org/driver-api/basics.html#wait-queues-and-wake-events)
+부 번호 범위를 직접 정하려면 `alloc_chrdev_region()`이나 `register_chrdev_region()`으로 번호를 확보한 뒤 `cdev_init()`과 `cdev_add()`로 연산을 연결할 수 있다. 이 방식의 해제는 `cdev_del()`과 `unregister_chrdev_region()`이 맡는다. `cdev_del()`은 이후의 열기를 막는다. 이미 열린 파일에서는 콜백이 계속 호출될 수 있으므로, 열린 파일이 참조하는 상태의 수명도 관리해야 한다. [문자 장치 번호 예약과 해제 구현](https://github.com/torvalds/linux/blob/v6.12/fs/char_dev.c), [`cdev_del()` 동작](https://docs.kernel.org/core-api/kernel-api.html#c.cdev_del)
 
 ## 2. 장치 번호를 파일 연산에 연결하는 과정
 
@@ -43,18 +44,17 @@
 
 센서의 샘플링 간격을 바꾸는 `ioctl()` 명령이라면 세 번째 인자로 새 간격을 담은 사용자 구조체의 주소를 넘길 수 있다. 드라이버는 `cmd`로 명령을 확인하고 구조체를 복사한 뒤 값을 검증한다. 파일 연산 구조체의 필드와 함수형은 커널 버전에 따라 바뀐다. 구형 커널에는 `.ioctl` 필드가 있었고, v6.12에서는 `.unlocked_ioctl`과 32비트 사용자 공간 호환 처리를 위한 `.compat_ioctl`을 확인할 수 있다. [커널 ioctl 인터페이스](https://docs.kernel.org/driver-api/ioctl.html), [v6.12 파일 연산 선언](https://github.com/torvalds/linux/blob/v6.12/include/linux/fs.h#L1929-L1946)
 
-## 4. `register_chrdev()`와 `unregister_chrdev()`
+## 4. 사용자 프로그램에서 장치에 접근하는 경로
 
-두 함수는 `<linux/fs.h>`에 선언된다. v6.12의 `register_chrdev()`는 주 번호 하나의 기본 부 번호 범위를 예약하고, 내부에서 `cdev`를 생성해 `fops`와 장치 번호 범위를 연결한다. 번호를 예약할 때는 주 번호에서 계산한 해시 버킷을 찾아 같은 주 번호에서 부 번호 범위가 겹치는지 확인한다. `name`은 `/proc/devices`와 커널 진단 메시지에서 등록 항목을 식별하는 데 쓰인다. `/dev`에 표시할 노드 이름과 노드의 생성·삭제는 별도로 관리한다. 사용자 프로그램이 열 노드에는 등록 범위에 맞는 문자 장치 유형과 번호가 들어 있어야 한다. [등록 함수 선언](https://github.com/torvalds/linux/blob/v6.12/include/linux/fs.h#L2634-L2652), [문자 장치 등록 구현](https://github.com/torvalds/linux/blob/v6.12/fs/char_dev.c), [장치 번호와 노드 이름](https://docs.kernel.org/admin-guide/devices.html)
+사용자 공간의 프로세스는 시스템 호출을 통해 커널에 장치 작업을 요청한다. 일반 파일의 내용은 파일 시스템이 관리한다. 문자 디바이스 파일은 장치 유형과 장치 번호를 담은 특수 파일이다. VFS는 이 정보를 이용해 커널에 등록된 드라이버를 찾고, 드라이버는 요청에 따라 하드웨어를 제어하거나 내부 버퍼를 처리한다. 드라이버는 커널에 내장하거나 실행 중 적재하는 모듈로 구성할 수 있다. [리눅스 VFS](https://docs.kernel.org/filesystems/vfs.html), [드라이버 초기화와 종료](https://docs.kernel.org/driver-api/basics.html#driver-entry-and-exit-points)
 
-| API와 조건 | 동작과 반환값 |
+| 유형 | 처리 단위와 일반적인 접근 경로 |
 | --- | --- |
-| `register_chrdev(0, name, fops)` | 비어 있는 주 번호를 동적으로 할당한다. 성공하면 양수인 실제 주 번호를 반환하므로 노드 생성과 해제에 사용할 값을 보관한다. |
-| `register_chrdev(major, name, fops)` (`major > 0`) | 지정한 주 번호의 범위를 예약한다. 성공하면 `0`을 반환하므로 지정한 번호를 계속 사용한다. |
-| 등록 실패 | 장치 번호 범위가 충돌하거나 동적 할당에 쓸 주 번호가 없으면 `-EBUSY`, 유효 범위를 벗어나면 `-EINVAL`, 관리 객체 할당에 실패하면 `-ENOMEM`이 발생할 수 있다. |
-| `unregister_chrdev(major, name)` | 등록할 때 사용한 이름과 실제 주 번호를 전달한다. 반환형은 `void`다. v6.12 구현은 주 번호와 부 번호 범위로 항목을 찾아 예약을 해제하고 대응하는 `cdev`를 제거한다. |
+| 문자 | 장치가 정의한 바이트 스트림이나 레코드를 다룬다. 사용자 프로그램은 장치 파일을 열어 `read()`, `write()`, `ioctl()` 등을 호출한다. |
+| 블록 | 저장장치의 데이터를 블록 단위로 처리한다. 파일 시스템은 블록 계층을 통해 입출력을 요청한다. 권한이 있으면 사용자 프로그램도 블록 장치 파일을 열 수 있다. |
+| 네트워크 | 패킷을 송수신한다. 사용자 프로그램은 주로 소켓을 사용하고, 커널의 네트워크 스택이 장치 드라이버와 통신한다. |
 
-부 번호 범위를 직접 정하려면 `alloc_chrdev_region()`이나 `register_chrdev_region()`으로 번호를 확보한 뒤 `cdev_init()`과 `cdev_add()`로 연산을 연결할 수 있다. 이 방식의 해제는 `cdev_del()`과 `unregister_chrdev_region()`이 맡는다. `cdev_del()`은 이후의 열기를 막는다. 이미 열린 파일에서는 콜백이 계속 호출될 수 있으므로, 열린 파일이 참조하는 상태의 수명도 관리해야 한다. [문자 장치 번호 예약과 해제 구현](https://github.com/torvalds/linux/blob/v6.12/fs/char_dev.c), [`cdev_del()` 동작](https://docs.kernel.org/core-api/kernel-api.html#c.cdev_del)
+문자 장치의 읽기·쓰기 단위와 종료 조건은 장치의 인터페이스에 따라 정해진다. 예를 들어 센서 이벤트는 계속 들어올 수 있으므로, 이벤트 큐가 비었을 때 블로킹 읽기는 다음 이벤트를 기다리고 비블로킹 읽기는 `EAGAIN`을 반환하도록 구현할 수 있다. 스트림 장치에서는 임의 위치로 이동하는 연산도 생략할 수 있다. [블록 계층](https://docs.kernel.org/block/blk-mq.html), [네트워크 장치](https://docs.kernel.org/networking/netdevices.html), [커널의 대기 큐](https://docs.kernel.org/driver-api/basics.html#wait-queues-and-wake-events)
 
 ## 5. 모듈 적재부터 제거까지
 
